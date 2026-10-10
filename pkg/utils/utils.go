@@ -636,3 +636,11 @@ func PrepareNumberForWhatsAppCheck(phone string, formatJid bool) (string, error)
 	}
 	return numbers[0], nil
 }
+
+// CanonicalJID normalizes a JID user part by stripping the leading "+" that
+// CreateJID adds to phone numbers, so lookups and comparisons match the stored
+// form. No-op for group and @lid JIDs.
+func CanonicalJID(jid whatsmeow_types.JID) whatsmeow_types.JID {
+	jid.User = strings.TrimPrefix(jid.User, "+")
+	return jid
+}
