@@ -153,6 +153,10 @@ func (i *instanceRepository) Delete(instanceId string) error {
 			return fmt.Errorf("erro ao deletar labels: %v", err)
 		}
 
+		if err := tx.Where("instance_id = ?", instanceId).Delete(&label_model.LabelChat{}).Error; err != nil {
+			return fmt.Errorf("erro ao deletar associações de labels: %v", err)
+		}
+
 		// Deleta todas as mensagens associadas à instância
 		if err := tx.Where("source = ?", instanceId).Delete(&message_model.Message{}).Error; err != nil {
 			return fmt.Errorf("erro ao deletar mensagens: %v", err)

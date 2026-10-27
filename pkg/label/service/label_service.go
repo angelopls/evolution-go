@@ -3,6 +3,10 @@ package label_service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
@@ -13,6 +17,7 @@ import (
 	whatsmeow_service "github.com/EvolutionAPI/evolution-go/pkg/whatsmeow/service"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type LabelService interface {
@@ -22,6 +27,7 @@ type LabelService interface {
 	ChatUnlabel(data *ChatLabelStruct, instance *instance_model.Instance) error
 	MessageUnlabel(data *MessageLabelStruct, instance *instance_model.Instance) error
 	GetLabels(instance *instance_model.Instance) ([]label_model.Label, error)
+	GetContactsByLabel(data *GetContactsByLabelStruct, instance *instance_model.Instance) (*LabelContactsResult, error)
 }
 
 type labelService struct {
@@ -223,6 +229,275 @@ func (l *labelService) GetLabels(instance *instance_model.Instance) ([]label_mod
 	}
 
 	return labels, nil
+}
+
+type GetContactsByLabelStruct struct {
+	LabelID       string `json:"labelId"`
+	LabelName     string `json:"labelName"`
+	Sync          *bool  `json:"sync,omitempty"`
+	IncludeGroups bool   `json:"includeGroups,omitempty"`
+}
+
+type LabelContactInfo struct {
+	JID          string `json:"jid"`
+	PhoneNumber  string `json:"phoneNumber"`
+	FirstName    string `json:"firstName"`
+	FullName     string `json:"fullName"`
+	PushName     string `json:"pushName"`
+	BusinessName string `json:"businessName"`
+	LID          string `json:"lid,omitempty"`
+	IsGroup      bool   `json:"isGroup"`
+}
+
+type LabelContactsResult struct {
+	Label    label_model.Label  `json:"label"`
+	Contacts []LabelContactInfo `json:"contacts"`
+	Total    int                `json:"total"`
+	Synced   bool               `json:"synced"`
+}
+
+// labelSyncMu protects the temporary EmitAppStateEventsOnFullSync flag used
+// while backfilling historical label associations from a full app state sync.
+// SIMPLIFICATION: one global lock; per-instance locks if parallel syncs matter.
+var labelSyncMu sync.Mutex
+
+func normalizeLabelName(name string) string {
+	// WhatsApp prefixes some predefined labels with invisible direction marks.
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '\u200e' || r == '\u200f' || r == '\u202a' || r == '\u202c' {
+			return -1
+		}
+		return r
+	}, name)
+	return strings.ToLower(strings.TrimSpace(cleaned))
+}
+
+func (l *labelService) resolveLabel(instanceID string, data *GetContactsByLabelStruct) (*label_model.Label, error) {
+	if data.LabelID != "" {
+		label, err := l.labelRepository.GetLabelByInstanceAndLabelID(instanceID, data.LabelID)
+		if err != nil {
+			return nil, err
+		}
+		return label, nil
+	}
+
+	if data.LabelName == "" {
+		return nil, errors.New("labelId or labelName is required")
+	}
+
+	labels, err := l.labelRepository.GetAllLabelsByInstanceID(instanceID)
+	if err != nil {
+		return nil, err
+	}
+
+	target := normalizeLabelName(data.LabelName)
+	for i := range labels {
+		if normalizeLabelName(labels[i].LabelName) == target {
+			return &labels[i], nil
+		}
+	}
+	for i := range labels {
+		if strings.Contains(normalizeLabelName(labels[i].LabelName), target) {
+			return &labels[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("label not found: %s", data.LabelName)
+}
+
+func (l *labelService) syncLabelAppState(client *whatsmeow.Client, instanceID string) error {
+	labelSyncMu.Lock()
+	defer labelSyncMu.Unlock()
+
+	previous := client.EmitAppStateEventsOnFullSync
+	client.EmitAppStateEventsOnFullSync = true
+	defer func() {
+		client.EmitAppStateEventsOnFullSync = previous
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	l.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Backfilling WhatsApp labels from regular app state", instanceID)
+	if err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false); err != nil {
+		l.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to sync labels: %v", instanceID, err)
+		return err
+	}
+	return nil
+}
+
+func (l *labelService) GetContactsByLabel(data *GetContactsByLabelStruct, instance *instance_model.Instance) (*LabelContactsResult, error) {
+	client, err := l.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	forceSync := data.Sync != nil && *data.Sync
+	synced := false
+
+	if forceSync {
+		if err := l.syncLabelAppState(client, instance.Id); err != nil {
+			return nil, err
+		}
+		synced = true
+	}
+
+	label, resolveErr := l.resolveLabel(instance.Id, data)
+	if resolveErr != nil && !synced {
+		// Labels may not have been synced to our database yet (e.g. first use
+		// after deploying this feature). Pull them once before giving up.
+		if syncErr := l.syncLabelAppState(client, instance.Id); syncErr == nil {
+			synced = true
+			label, resolveErr = l.resolveLabel(instance.Id, data)
+		}
+	}
+	if resolveErr != nil {
+		return nil, resolveErr
+	}
+	if label == nil {
+		ref := data.LabelID
+		if ref == "" {
+			ref = data.LabelName
+		}
+		return nil, fmt.Errorf("label not found: %s", ref)
+	}
+
+	jids, err := l.labelRepository.GetChatJIDsByLabel(instance.Id, label.LabelID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(jids) == 0 && !synced {
+		// Only backfill once per instance: if any label association is already
+		// stored, this label is simply empty and another full sync is waste.
+		existing, countErr := l.labelRepository.CountLabelChatsByInstanceID(instance.Id)
+		if countErr != nil {
+			return nil, countErr
+		}
+		if existing == 0 {
+			if err := l.syncLabelAppState(client, instance.Id); err != nil {
+				return nil, err
+			}
+			synced = true
+			jids, err = l.labelRepository.GetChatJIDsByLabel(instance.Id, label.LabelID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	ctx := context.Background()
+	contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &LabelContactsResult{
+		Label:    *label,
+		Contacts: make([]LabelContactInfo, 0, len(jids)),
+		Synced:   synced,
+	}
+
+	seen := make(map[string]int, len(jids))
+	for _, rawJID := range jids {
+		contact, ok := l.buildLabelContact(ctx, client, contacts, rawJID, data.IncludeGroups)
+		if !ok {
+			continue
+		}
+
+		key := contact.PhoneNumber
+		if key == "" {
+			key = contact.JID
+		}
+		if idx, exists := seen[key]; exists {
+			if result.Contacts[idx].FullName == "" && contact.FullName != "" {
+				result.Contacts[idx] = *contact
+			}
+			continue
+		}
+		seen[key] = len(result.Contacts)
+		result.Contacts = append(result.Contacts, *contact)
+	}
+
+	sort.Slice(result.Contacts, func(i, j int) bool {
+		left := contactSortName(result.Contacts[i])
+		right := contactSortName(result.Contacts[j])
+		if left == right {
+			return result.Contacts[i].JID < result.Contacts[j].JID
+		}
+		return left < right
+	})
+	result.Total = len(result.Contacts)
+
+	return result, nil
+}
+
+func contactSortName(contact LabelContactInfo) string {
+	for _, value := range []string{contact.FullName, contact.PushName, contact.BusinessName, contact.FirstName, contact.PhoneNumber} {
+		if strings.TrimSpace(value) != "" {
+			return strings.ToLower(value)
+		}
+	}
+	return ""
+}
+
+func (l *labelService) buildLabelContact(
+	ctx context.Context,
+	client *whatsmeow.Client,
+	contacts map[types.JID]types.ContactInfo,
+	rawJID string,
+	includeGroups bool,
+) (*LabelContactInfo, bool) {
+	jid, err := types.ParseJID(rawJID)
+	if err != nil {
+		return nil, false
+	}
+	jid = jid.ToNonAD()
+
+	isGroup := jid.Server == types.GroupServer
+	if isGroup && !includeGroups {
+		return nil, false
+	}
+
+	contact := &LabelContactInfo{JID: jid.String(), IsGroup: isGroup}
+	if isGroup {
+		return contact, true
+	}
+
+	contactJID := jid
+	switch jid.Server {
+	case types.DefaultUserServer:
+		contact.PhoneNumber = jid.User
+		if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
+			contact.LID = lid.User
+		}
+	case types.HiddenUserServer:
+		contact.LID = jid.User
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			contactJID = pn.ToNonAD()
+			contact.PhoneNumber = contactJID.User
+		}
+	}
+
+	info, found := contacts[jid]
+	if !found && contactJID != jid {
+		info, found = contacts[contactJID]
+	}
+	if !found && contact.LID != "" {
+		info, found = contacts[types.NewJID(contact.LID, types.HiddenUserServer)]
+	}
+	if found {
+		contact.FirstName = info.FirstName
+		contact.FullName = info.FullName
+		contact.PushName = info.PushName
+		contact.BusinessName = info.BusinessName
+	}
+
+	if contact.PhoneNumber == "" && contactJID.Server == types.DefaultUserServer {
+		contact.PhoneNumber = contactJID.User
+	}
+
+	return contact, true
 }
 
 func NewLabelService(

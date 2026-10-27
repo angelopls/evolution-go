@@ -2,6 +2,7 @@ package label_handler
 
 import (
 	"net/http"
+	"strconv"
 
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	label_service "github.com/EvolutionAPI/evolution-go/pkg/label/service"
@@ -15,6 +16,7 @@ type LabelHandler interface {
 	ChatUnlabel(ctx *gin.Context)
 	MessageUnlabel(ctx *gin.Context)
 	GetLabels(ctx *gin.Context)
+	GetContactsByLabel(ctx *gin.Context)
 }
 
 type labelHandler struct {
@@ -286,6 +288,66 @@ func (l *labelHandler) GetLabels(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, labels)
+}
+
+// Get contacts that have a WhatsApp native label
+// @Summary Get contacts by native WhatsApp label
+// @Description Returns the contacts/chats associated with a native WhatsApp label (list)
+// @Tags Label
+// @Accept json
+// @Produce json
+// @Param labelId query string false "Native WhatsApp label id"
+// @Param labelName query string false "Native WhatsApp label name"
+// @Param sync query bool false "Force backfill from WhatsApp app state"
+// @Param includeGroups query bool false "Include labeled groups"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /label/contacts [get]
+func (l *labelHandler) GetContactsByLabel(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	data := &label_service.GetContactsByLabelStruct{
+		LabelID:   ctx.Query("labelId"),
+		LabelName: ctx.Query("labelName"),
+	}
+
+	if syncParam := ctx.Query("sync"); syncParam != "" {
+		sync, err := strconv.ParseBool(syncParam)
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "sync must be a boolean"})
+			return
+		}
+		data.Sync = &sync
+	}
+
+	if groupsParam := ctx.Query("includeGroups"); groupsParam != "" {
+		includeGroups, err := strconv.ParseBool(groupsParam)
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "includeGroups must be a boolean"})
+			return
+		}
+		data.IncludeGroups = includeGroups
+	}
+
+	if data.LabelID == "" && data.LabelName == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "labelId or labelName is required"})
+		return
+	}
+
+	result, err := l.labelService.GetContactsByLabel(data, instance)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": result})
 }
 
 func NewLabelHandler(

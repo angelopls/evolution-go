@@ -1626,17 +1626,17 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			buttonClickMap := map[string]interface{}{
 				"event": "ButtonClick",
 				"data": map[string]interface{}{
-					"buttonId":     buttonClickData["buttonId"],
-					"buttonText":   buttonClickData["buttonText"],
-					"type":         buttonClickData["type"],
-					"phone":        dataMap["Sender"],
-					"jid":          dataMap["Sender"],
-					"pushName":     dataMap["PushName"],
-					"messageId":    dataMap["ID"],
-					"chat":         dataMap["Chat"],
-					"fromMe":       dataMap["FromMe"],
-					"timestamp":    evt.Info.Timestamp.Unix(),
-					"extraData":    buttonClickData,
+					"buttonId":   buttonClickData["buttonId"],
+					"buttonText": buttonClickData["buttonText"],
+					"type":       buttonClickData["type"],
+					"phone":      dataMap["Sender"],
+					"jid":        dataMap["Sender"],
+					"pushName":   dataMap["PushName"],
+					"messageId":  dataMap["ID"],
+					"chat":       dataMap["Chat"],
+					"fromMe":     dataMap["FromMe"],
+					"timestamp":  evt.Info.Timestamp.Unix(),
+					"extraData":  buttonClickData,
 				},
 				"instanceToken": mycli.token,
 				"instanceId":    mycli.userID,
@@ -1936,6 +1936,14 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "LabelAssociationChat"
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Label association chat received %+v", mycli.userID, evt)
+
+		if !evt.JID.IsEmpty() {
+			labeled := evt.Action != nil && evt.Action.GetLabeled()
+			jid := evt.JID.ToNonAD().String()
+			if err := mycli.labelRepository.UpsertLabelChat(mycli.userID, evt.LabelID, jid, labeled); err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to persist label association: %v", mycli.userID, err)
+			}
+		}
 	case *events.LabelAssociationMessage:
 		doWebhook = true
 		postMap["event"] = "LabelAssociationMessage"
@@ -1988,6 +1996,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	default:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Unhandled event %s: %+v", mycli.userID, fmt.Sprintf("%T", evt), evt)
 		return
+	}
+
+	if doWebhook && isFullSyncEvent(rawEvt) {
+		doWebhook = false
 	}
 
 	if doWebhook {
@@ -2754,4 +2766,43 @@ func cleanSenderID(senderID string) string {
 		}
 	}
 	return senderID
+}
+
+// isFullSyncEvent reports whether an app-state event came from a full sync.
+// Historical full-sync state is persisted locally but must not be replayed to
+// webhook consumers as if it had just happened on the device.
+func isFullSyncEvent(rawEvt interface{}) bool {
+	switch evt := rawEvt.(type) {
+	case *events.Mute:
+		return evt.FromFullSync
+	case *events.Pin:
+		return evt.FromFullSync
+	case *events.Archive:
+		return evt.FromFullSync
+	case *events.Contact:
+		return evt.FromFullSync
+	case *events.ClearChat:
+		return evt.FromFullSync
+	case *events.DeleteChat:
+		return evt.FromFullSync
+	case *events.Star:
+		return evt.FromFullSync
+	case *events.DeleteForMe:
+		return evt.FromFullSync
+	case *events.MarkChatAsRead:
+		return evt.FromFullSync
+	case *events.PushNameSetting:
+		return evt.FromFullSync
+	case *events.UnarchiveChatsSetting:
+		return evt.FromFullSync
+	case *events.UserStatusMute:
+		return evt.FromFullSync
+	case *events.LabelEdit:
+		return evt.FromFullSync
+	case *events.LabelAssociationChat:
+		return evt.FromFullSync
+	case *events.LabelAssociationMessage:
+		return evt.FromFullSync
+	}
+	return false
 }
