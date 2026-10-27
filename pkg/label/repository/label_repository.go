@@ -15,9 +15,16 @@ type LabelRepository interface {
 	UpsertLabel(label label_model.Label) error
 	UpsertLabelChat(instanceID, labelID, jid string, labeled bool) error
 	GetChatJIDsByLabel(instanceID, labelID string) ([]string, error)
+	GetAllLabelChatsByInstanceID(instanceID string) ([]LabelChatWithLabel, error)
 	CountLabelChatsByInstanceID(instanceID string) (int64, error)
 	GetLabelByInstanceAndLabelID(instanceID, labelID string) (*label_model.Label, error)
 	DeleteLabelChatsByInstanceID(instanceID string) error
+}
+
+type LabelChatWithLabel struct {
+	JID       string `gorm:"column:jid"`
+	LabelID   string `gorm:"column:label_id"`
+	LabelName string `gorm:"column:label_name"`
 }
 
 type labelRepository struct {
@@ -101,6 +108,19 @@ func (l *labelRepository) GetChatJIDsByLabel(instanceID, labelID string) ([]stri
 		return nil, err
 	}
 	return jids, nil
+}
+
+func (l *labelRepository) GetAllLabelChatsByInstanceID(instanceID string) ([]LabelChatWithLabel, error) {
+	var rows []LabelChatWithLabel
+	err := l.db.Table("label_chats").
+		Select("label_chats.jid, labels.label_id, labels.label_name").
+		Joins("JOIN labels ON labels.instance_id = label_chats.instance_id AND labels.label_id = label_chats.label_id").
+		Where("label_chats.instance_id = ? AND label_chats.labeled = ?", instanceID, true).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (l *labelRepository) CountLabelChatsByInstanceID(instanceID string) (int64, error) {

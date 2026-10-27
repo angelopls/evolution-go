@@ -28,6 +28,7 @@ type LabelService interface {
 	MessageUnlabel(data *MessageLabelStruct, instance *instance_model.Instance) error
 	GetLabels(instance *instance_model.Instance) ([]label_model.Label, error)
 	GetContactsByLabel(data *GetContactsByLabelStruct, instance *instance_model.Instance) (*LabelContactsResult, error)
+	GetAllContactsByLabel(instance *instance_model.Instance) (*AllLabelContactsResult, error)
 }
 
 type labelService struct {
@@ -256,12 +257,26 @@ type LabelContactsResult struct {
 	Synced   bool               `json:"synced"`
 }
 
+type AllLabelContactInfo struct {
+	JID         string   `json:"jid"`
+	PhoneNumber string   `json:"phoneNumber"`
+	LID         string   `json:"lid,omitempty"`
+	IsGroup     bool     `json:"isGroup"`
+	Labels      []string `json:"labels"`
+}
+
+type AllLabelContactsResult struct {
+	Contacts []AllLabelContactInfo `json:"contacts"`
+	Total    int                   `json:"total"`
+	Synced   bool                  `json:"synced"`
+}
+
 // labelSyncMu protects the temporary EmitAppStateEventsOnFullSync flag used
 // while backfilling historical label associations from a full app state sync.
 // SIMPLIFICATION: one global lock; per-instance locks if parallel syncs matter.
 var labelSyncMu sync.Mutex
 
-func normalizeLabelName(name string) string {
+func cleanLabelName(name string) string {
 	// WhatsApp prefixes some predefined labels with invisible direction marks.
 	cleaned := strings.Map(func(r rune) rune {
 		if r == '\u200e' || r == '\u200f' || r == '\u202a' || r == '\u202c' {
@@ -269,7 +284,11 @@ func normalizeLabelName(name string) string {
 		}
 		return r
 	}, name)
-	return strings.ToLower(strings.TrimSpace(cleaned))
+	return strings.TrimSpace(cleaned)
+}
+
+func normalizeLabelName(name string) string {
+	return strings.ToLower(cleanLabelName(name))
 }
 
 func (l *labelService) resolveLabel(instanceID string, data *GetContactsByLabelStruct) (*label_model.Label, error) {
@@ -426,6 +445,95 @@ func (l *labelService) GetContactsByLabel(data *GetContactsByLabelStruct, instan
 			return result.Contacts[i].JID < result.Contacts[j].JID
 		}
 		return left < right
+	})
+	result.Total = len(result.Contacts)
+
+	return result, nil
+}
+
+func (l *labelService) GetAllContactsByLabel(instance *instance_model.Instance) (*AllLabelContactsResult, error) {
+	client, err := l.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := l.labelRepository.GetAllLabelChatsByInstanceID(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	synced := false
+	if len(rows) == 0 {
+		// First use after deploying the feature: pull native label associations once.
+		if err := l.syncLabelAppState(client, instance.Id); err != nil {
+			return nil, err
+		}
+		synced = true
+		rows, err = l.labelRepository.GetAllLabelChatsByInstanceID(instance.Id)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ctx := context.Background()
+	contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	labelsByJID := make(map[string][]string, len(rows))
+	for _, row := range rows {
+		name := cleanLabelName(row.LabelName)
+		if name == "" {
+			continue
+		}
+		labelsByJID[row.JID] = append(labelsByJID[row.JID], name)
+	}
+
+	result := &AllLabelContactsResult{
+		Contacts: make([]AllLabelContactInfo, 0, len(labelsByJID)),
+		Synced:   synced,
+	}
+	index := make(map[string]int, len(labelsByJID))
+	for rawJID, labelNames := range labelsByJID {
+		contact, ok := l.buildLabelContact(ctx, client, contacts, rawJID, false)
+		if !ok {
+			continue
+		}
+
+		key := contact.PhoneNumber
+		if key == "" {
+			key = contact.JID
+		}
+		idx, exists := index[key]
+		if !exists {
+			index[key] = len(result.Contacts)
+			result.Contacts = append(result.Contacts, AllLabelContactInfo{
+				JID:         contact.JID,
+				PhoneNumber: contact.PhoneNumber,
+				LID:         contact.LID,
+				IsGroup:     contact.IsGroup,
+				Labels:      []string{},
+			})
+			idx = index[key]
+		}
+
+		for _, labelName := range labelNames {
+			duplicate := false
+			for _, existing := range result.Contacts[idx].Labels {
+				if normalizeLabelName(existing) == normalizeLabelName(labelName) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				result.Contacts[idx].Labels = append(result.Contacts[idx].Labels, labelName)
+			}
+		}
+	}
+
+	sort.Slice(result.Contacts, func(i, j int) bool {
+		return result.Contacts[i].JID < result.Contacts[j].JID
 	})
 	result.Total = len(result.Contacts)
 

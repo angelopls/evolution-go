@@ -212,6 +212,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/edit", r.labelHandler.EditLabel)
 			routes.GET("/list", r.labelHandler.GetLabels)
 			routes.GET("/contacts", r.labelHandler.GetContactsByLabel)
+			routes.GET("/contacts/all", r.labelHandler.GetAllContactsByLabel)
 		}
 	}
 	routes = eng.Group("/unlabel")
