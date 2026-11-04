@@ -1,7 +1,9 @@
 package group_handler
 
 import (
+	"errors"
 	"net/http"
+	"strconv"
 
 	group_service "github.com/EvolutionAPI/evolution-go/pkg/group/service"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
@@ -46,6 +48,16 @@ func (g *groupHandler) ListGroups(ctx *gin.Context) {
 
 	resp, err := g.groupService.ListGroups(instance)
 	if err != nil {
+		if errors.Is(err, group_service.ErrGroupListRateLimited) {
+			retryAfter := 600
+			var rateLimitErr *group_service.GroupListRateLimitError
+			if errors.As(err, &rateLimitErr) {
+				retryAfter = int(rateLimitErr.RetryAfter.Seconds())
+			}
+			ctx.Header("Retry-After", strconv.Itoa(retryAfter))
+			ctx.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+			return
+		}
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

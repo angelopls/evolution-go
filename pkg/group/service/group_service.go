@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
@@ -36,10 +37,55 @@ type GroupService interface {
 	LeaveGroup(data *LeaveGroupStruct, instance *instance_model.Instance) error
 }
 
+const (
+	groupListCacheTTL       = 5 * time.Minute
+	groupListDefaultBackoff = 10 * time.Minute
+)
+
+// ErrGroupListRateLimited indica que o WhatsApp recusou a consulta de grupos
+// por rate limit (429). O cliente deve tentar novamente depois do backoff.
+var ErrGroupListRateLimited = errors.New("whatsapp rate limit on group list")
+
+// GroupListRateLimitError carrega quanto tempo o cliente deve aguardar
+// antes de tentar novamente.
+type GroupListRateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *GroupListRateLimitError) Error() string {
+	return fmt.Sprintf("%s, retry in %s", ErrGroupListRateLimited, e.RetryAfter.Round(time.Second))
+}
+
+func (e *GroupListRateLimitError) Is(target error) bool {
+	return target == ErrGroupListRateLimited
+}
+
+type groupListCacheEntry struct {
+	mu        sync.Mutex
+	groups    []*types.GroupInfo
+	fetchedAt time.Time
+	retryAt   time.Time
+}
+
 type groupService struct {
 	clientPointer    map[string]*whatsmeow.Client
 	whatsmeowService whatsmeow_service.WhatsmeowService
 	loggerWrapper    *logger_wrapper.LoggerManager
+
+	groupCacheMu sync.Mutex
+	groupCache   map[string]*groupListCacheEntry
+}
+
+func (g *groupService) groupCacheFor(instanceID string) *groupListCacheEntry {
+	g.groupCacheMu.Lock()
+	defer g.groupCacheMu.Unlock()
+
+	entry, ok := g.groupCache[instanceID]
+	if !ok {
+		entry = &groupListCacheEntry{}
+		g.groupCache[instanceID] = entry
+	}
+	return entry
 }
 
 type SimpleGroupInfo struct {
@@ -116,7 +162,6 @@ type UpdateGroupRequestParticipantsStruct struct {
 	Participants []string `json:"participants"`
 }
 
-
 func (g *groupService) ensureClientConnected(instanceId string) (*whatsmeow.Client, error) {
 	client := g.clientPointer[instanceId]
 	g.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Checking client connection status - Client exists: %v", instanceId, client != nil)
@@ -162,11 +207,47 @@ func (g *groupService) ListGroups(instance *instance_model.Instance) ([]*types.G
 		return nil, err
 	}
 
+	entry := g.groupCacheFor(instance.Id)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	now := time.Now()
+	if len(entry.groups) > 0 && now.Sub(entry.fetchedAt) < groupListCacheTTL {
+		return entry.groups, nil
+	}
+
+	if now.Before(entry.retryAt) {
+		if len(entry.groups) > 0 {
+			return entry.groups, nil
+		}
+		remaining := time.Until(entry.retryAt).Round(time.Second)
+		return nil, &GroupListRateLimitError{RetryAfter: remaining}
+	}
+
 	resp, err := client.GetJoinedGroups(context.Background())
 	if err != nil {
+		var iqErr *whatsmeow.IQError
+		if errors.As(err, &iqErr) && iqErr.Code == 429 {
+			backoff := groupListDefaultBackoff
+			if iqErr.ErrorNode != nil {
+				if seconds := iqErr.ErrorNode.AttrGetter().OptionalInt("backoff"); seconds > 0 {
+					backoff = time.Duration(seconds) * time.Second
+				}
+			}
+			entry.retryAt = now.Add(backoff)
+			g.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] group list rate limited by WhatsApp; next attempt in %s", instance.Id, backoff)
+			if len(entry.groups) > 0 {
+				return entry.groups, nil
+			}
+			return nil, &GroupListRateLimitError{RetryAfter: backoff}
+		}
 		g.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error getting groups: %v", instance.Id, err)
 		return nil, err
 	}
+
+	entry.groups = resp
+	entry.fetchedAt = now
+	entry.retryAt = time.Time{}
 
 	gc := new(GroupCollection)
 	for _, info := range resp {
@@ -413,7 +494,7 @@ func (g *groupService) GetMyGroups(instance *instance_model.Instance) ([]types.G
 		return nil, err
 	}
 
-	resp, err := client.GetJoinedGroups(context.Background())
+	resp, err := g.ListGroups(instance)
 	if err != nil {
 		g.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error create group: %v", instance.Id, err)
 		return nil, err
@@ -650,5 +731,6 @@ func NewGroupService(
 		clientPointer:    clientPointer,
 		whatsmeowService: whatsmeowService,
 		loggerWrapper:    loggerWrapper,
+		groupCache:       make(map[string]*groupListCacheEntry),
 	}
 }

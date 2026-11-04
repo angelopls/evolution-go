@@ -349,7 +349,9 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 		case <-time.After(5 * time.Second):
 		}
 
+		whatsmeow_service.ClientMapsMu.Lock()
 		delete(i.clientPointer, instance.Id)
+		whatsmeow_service.ClientMapsMu.Unlock()
 		delete(i.killChannel, instance.Id)
 
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Logout successful", instance.Id)
@@ -364,7 +366,9 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 		case <-time.After(5 * time.Second):
 		}
 
+		whatsmeow_service.ClientMapsMu.Lock()
 		delete(i.clientPointer, instance.Id)
+		whatsmeow_service.ClientMapsMu.Unlock()
 		delete(i.killChannel, instance.Id)
 
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Disconnection successful", instance.Id)
@@ -558,7 +562,9 @@ func (i instances) Delete(id string) error {
 	}
 
 	// Limpar todos os recursos da instância antes de deletar
+	whatsmeow_service.ClientMapsMu.Lock()
 	delete(i.clientPointer, instance.Id)
+	whatsmeow_service.ClientMapsMu.Unlock()
 	if i.killChannel[instance.Id] != nil {
 		close(i.killChannel[instance.Id])
 		delete(i.killChannel, instance.Id)
@@ -707,7 +713,9 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		case <-time.After(5 * time.Second):
 		}
 
+		whatsmeow_service.ClientMapsMu.Lock()
 		delete(i.clientPointer, instance.Id)
+		whatsmeow_service.ClientMapsMu.Unlock()
 		delete(i.killChannel, instance.Id)
 	}
 

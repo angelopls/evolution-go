@@ -79,6 +79,11 @@ type clientVersion struct {
 // em goroutine por instancia, entao a escrita e serializada aqui.
 var waVersionMu sync.Mutex
 
+// ClientMapsMu serializa escritas em clientPointer/myClientPointer. StartClient
+// roda em uma goroutine por instancia; escritas concorrentes nesses maps
+// disparam "fatal error: concurrent map writes" no boot.
+var ClientMapsMu sync.Mutex
+
 func applyWAVersion(v clientVersion) {
 	if v.Major == 0 && v.Minor == 0 && v.Patch == 0 {
 		return
@@ -101,6 +106,7 @@ type whatsmeowService struct {
 	config             *config.Config
 	killChannel        map[string](chan bool)
 	userInfoCache      *cache.Cache
+	groupInfoCache     *cache.Cache
 	clientPointer      map[string]*whatsmeow.Client
 	myClientPointer    map[string]*MyClient
 	rabbitmqProducer   producer_interfaces.Producer
@@ -133,6 +139,7 @@ type MyClient struct {
 	clientPointer      map[string]*whatsmeow.Client
 	killChannel        map[string](chan bool)
 	userInfoCache      *cache.Cache
+	groupInfoCache     *cache.Cache
 	config             *config.Config
 	historySyncID      int32
 	rabbitmqProducer   producer_interfaces.Producer
@@ -208,8 +215,10 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	}
 
 	// Remover das estruturas
+	ClientMapsMu.Lock()
 	delete(w.clientPointer, instanceId)
 	delete(w.myClientPointer, instanceId)
+	ClientMapsMu.Unlock()
 	delete(w.killChannel, instanceId)
 
 	// Limpar cache de userInfo para esta instância
@@ -431,7 +440,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	clientLog := waLog.Stdout("Client", minLevel, true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 
+	ClientMapsMu.Lock()
 	w.clientPointer[cd.Instance.Id] = client
+	ClientMapsMu.Unlock()
 
 	if cd.IsProxy {
 		var proxyConfig ProxyConfig
@@ -500,6 +511,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		labelRepository:    w.labelRepository,
 		pollService:        w.pollService, // NOVO: Serviço de enquetes
 		userInfoCache:      w.userInfoCache,
+		groupInfoCache:     w.groupInfoCache,
 		clientPointer:      w.clientPointer,
 		killChannel:        w.killChannel,
 		config:             w.config,
@@ -517,7 +529,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
 	// Armazena o MyClient no map para permitir atualizações posteriores
+	ClientMapsMu.Lock()
 	w.myClientPointer[cd.Instance.Id] = mycli
+	ClientMapsMu.Unlock()
 
 	if client.Store.ID != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Already logged in with JID: %s", cd.Instance.Id, client.Store.ID.String())
@@ -629,8 +643,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 						// 4. Limpar recursos
 						w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Cleaning up resources due to QR limit", cd.Instance.Id)
+						ClientMapsMu.Lock()
 						delete(w.clientPointer, cd.Instance.Id)
 						delete(w.myClientPointer, cd.Instance.Id)
+						ClientMapsMu.Unlock()
 
 						// 5. Enviar sinal de kill
 						if killChan, exists := w.killChannel[cd.Instance.Id]; exists {
@@ -728,8 +744,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 					}
 
 					w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] QR timeout killing channel", cd.Instance.Id)
+					ClientMapsMu.Lock()
 					delete(w.clientPointer, cd.Instance.Id)
 					delete(w.myClientPointer, cd.Instance.Id)
+					ClientMapsMu.Unlock()
 					w.killChannel[cd.Instance.Id] <- true
 
 					postMap := make(map[string]interface{})
@@ -786,8 +804,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
+			ClientMapsMu.Lock()
 			delete(w.clientPointer, cd.Instance.Id)
 			delete(w.myClientPointer, cd.Instance.Id)
+			ClientMapsMu.Unlock()
 
 			// Limpar cache de userInfo para esta instância
 			w.userInfoCache.Delete(cd.Instance.Token)
@@ -891,6 +911,26 @@ func processPresenceUpdates(mycli *MyClient) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Marked self as available", mycli.userID)
 		}
 	}
+}
+
+// getGroupInfoCached evita consultar o WhatsApp a cada mensagem de grupo.
+// Sem o cache, uma rajada de mensagens dispara GetGroupInfo por mensagem e o
+// WhatsApp responde 429 rate-overlimit, afetando tambem /group/list.
+func (mycli *MyClient) getGroupInfoCached(chat types.JID) (*types.GroupInfo, error) {
+	cacheKey := mycli.userID + ":" + chat.String()
+	if cached, found := mycli.groupInfoCache.Get(cacheKey); found {
+		if info, ok := cached.(*types.GroupInfo); ok {
+			return info, nil
+		}
+	}
+
+	info, err := mycli.WAClient.GetGroupInfo(context.Background(), chat)
+	if err != nil {
+		return nil, err
+	}
+
+	mycli.groupInfoCache.Set(cacheKey, info, cache.DefaultExpiration)
+	return info, nil
 }
 
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
@@ -1533,7 +1573,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		isGroup := strings.HasSuffix(evt.Info.Chat.String(), "@g.us")
 		if isGroup {
-			groupData, err := mycli.WAClient.GetGroupInfo(context.Background(), evt.Info.Chat)
+			groupData, err := mycli.getGroupInfoCached(evt.Info.Chat)
 			if err == nil {
 				dataMap["groupData"] = groupData
 			}
@@ -1743,7 +1783,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "Archive"
 
-		dataMap := postMap["data"].(map[string]interface{})
+		dataMap, ok := postMap["data"].(map[string]interface{})
+		if !ok {
+			dataMap = make(map[string]interface{})
+		}
 		dataMap["JID"] = evt.JID
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
@@ -2678,6 +2721,7 @@ func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) er
 	// Limpar userInfoCache
 	w.userInfoCache.Delete(token)
 
+	ClientMapsMu.Lock()
 	// Limpar myClientPointer se existir
 	if _, exists := w.myClientPointer[instanceId]; exists {
 		delete(w.myClientPointer, instanceId)
@@ -2689,6 +2733,7 @@ func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) er
 		delete(w.clientPointer, instanceId)
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Client pointer cleared", instanceId)
 	}
+	ClientMapsMu.Unlock()
 
 	// Limpar killChannel se existir
 	if killChan, exists := w.killChannel[instanceId]; exists {
@@ -2736,6 +2781,7 @@ func NewWhatsmeowService(
 		config:             config,
 		killChannel:        killChannel,
 		userInfoCache:      cache.New(5*time.Minute, 10*time.Minute),
+		groupInfoCache:     cache.New(5*time.Minute, 10*time.Minute),
 		clientPointer:      clientPointer,
 		myClientPointer:    make(map[string]*MyClient),
 		rabbitmqProducer:   rabbitmqProducer,
