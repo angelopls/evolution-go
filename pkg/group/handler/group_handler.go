@@ -8,6 +8,7 @@ import (
 	group_service "github.com/EvolutionAPI/evolution-go/pkg/group/service"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	"github.com/gin-gonic/gin"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type GroupHandler interface {
@@ -46,7 +47,14 @@ func (g *groupHandler) ListGroups(ctx *gin.Context) {
 		return
 	}
 
-	resp, err := g.groupService.ListGroups(instance)
+	simple, _ := strconv.ParseBool(ctx.Query("simple"))
+	var resp []*types.GroupInfo
+	var err error
+	if simple {
+		resp, err = g.groupService.ListGroupsSimple(instance)
+	} else {
+		resp, err = g.groupService.ListGroups(instance)
+	}
 	if err != nil {
 		if errors.Is(err, group_service.ErrGroupListRateLimited) {
 			retryAfter := 600
@@ -59,6 +67,18 @@ func (g *groupHandler) ListGroups(ctx *gin.Context) {
 			return
 		}
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if simple {
+		groups := make([]group_service.SimpleGroupInfo, 0, len(resp))
+		for _, info := range resp {
+			groups = append(groups, group_service.SimpleGroupInfo{
+				JID:       info.JID,
+				GroupName: info.GroupName.Name,
+			})
+		}
+		ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": groups})
 		return
 	}
 

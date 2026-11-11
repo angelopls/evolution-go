@@ -22,6 +22,7 @@ import (
 
 type GroupService interface {
 	ListGroups(instance *instance_model.Instance) ([]*types.GroupInfo, error)
+	ListGroupsSimple(instance *instance_model.Instance) ([]*types.GroupInfo, error)
 	GetGroupInfo(data *GetGroupInfoStruct, instance *instance_model.Instance) (*types.GroupInfo, error)
 	GetGroupInviteLink(data *GetGroupInviteLinkStruct, instance *instance_model.Instance) (string, error)
 	SetGroupPhoto(data *SetGroupPhotoStruct, instance *instance_model.Instance) (string, error)
@@ -38,7 +39,7 @@ type GroupService interface {
 }
 
 const (
-	groupListCacheTTL       = 5 * time.Minute
+	groupListCacheTTL       = 15 * time.Minute
 	groupListDefaultBackoff = 10 * time.Minute
 )
 
@@ -76,14 +77,19 @@ type groupService struct {
 	groupCache   map[string]*groupListCacheEntry
 }
 
-func (g *groupService) groupCacheFor(instanceID string) *groupListCacheEntry {
+func (g *groupService) groupCacheFor(instanceID string, simple bool) *groupListCacheEntry {
+	key := instanceID
+	if simple {
+		key += ":simple"
+	}
+
 	g.groupCacheMu.Lock()
 	defer g.groupCacheMu.Unlock()
 
-	entry, ok := g.groupCache[instanceID]
+	entry, ok := g.groupCache[key]
 	if !ok {
 		entry = &groupListCacheEntry{}
-		g.groupCache[instanceID] = entry
+		g.groupCache[key] = entry
 	}
 	return entry
 }
@@ -202,12 +208,37 @@ func (g *groupService) ensureClientConnected(instanceId string) (*whatsmeow.Clie
 }
 
 func (g *groupService) ListGroups(instance *instance_model.Instance) ([]*types.GroupInfo, error) {
+	return g.listGroups(instance, false)
+}
+
+// ListGroupsSimple returns the group list without participant arrays or
+// descriptions. It is considerably cheaper for instances that belong to many
+// large groups and is intended for callers that only need JID/name/count.
+func (g *groupService) ListGroupsSimple(instance *instance_model.Instance) ([]*types.GroupInfo, error) {
+	return g.listGroups(instance, true)
+}
+
+func (g *groupService) listGroups(instance *instance_model.Instance, simple bool) ([]*types.GroupInfo, error) {
 	client, err := g.ensureClientConnected(instance.Id)
 	if err != nil {
 		return nil, err
 	}
 
-	entry := g.groupCacheFor(instance.Id)
+	// A simple request can reuse a fresh full cache entry: the handler trims
+	// the response to the lightweight fields, so no extra WhatsApp round-trip
+	// is needed when the full list was already fetched.
+	if simple {
+		fullEntry := g.groupCacheFor(instance.Id, false)
+		fullEntry.mu.Lock()
+		if len(fullEntry.groups) > 0 && time.Since(fullEntry.fetchedAt) < groupListCacheTTL {
+			groups := fullEntry.groups
+			fullEntry.mu.Unlock()
+			return groups, nil
+		}
+		fullEntry.mu.Unlock()
+	}
+
+	entry := g.groupCacheFor(instance.Id, simple)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
@@ -224,7 +255,12 @@ func (g *groupService) ListGroups(instance *instance_model.Instance) ([]*types.G
 		return nil, &GroupListRateLimitError{RetryAfter: remaining}
 	}
 
-	resp, err := client.GetJoinedGroups(context.Background())
+	var resp []*types.GroupInfo
+	if simple {
+		resp, err = client.GetJoinedGroupsSimple(context.Background())
+	} else {
+		resp, err = client.GetJoinedGroups(context.Background())
+	}
 	if err != nil {
 		var iqErr *whatsmeow.IQError
 		if errors.As(err, &iqErr) && iqErr.Code == 429 {
@@ -248,15 +284,6 @@ func (g *groupService) ListGroups(instance *instance_model.Instance) ([]*types.G
 	entry.groups = resp
 	entry.fetchedAt = now
 	entry.retryAt = time.Time{}
-
-	gc := new(GroupCollection)
-	for _, info := range resp {
-		simpleGroup := SimpleGroupInfo{
-			JID:       info.JID,
-			GroupName: info.GroupName.Name,
-		}
-		gc.Groups = append(gc.Groups, simpleGroup)
-	}
 
 	return resp, nil
 }
